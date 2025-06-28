@@ -3,3 +3,4 @@ openai
 python-docx
 streamlit
 xlsxwriter
+openpyxl
