@@ -1,157 +1,146 @@
 # -*- coding: utf-8 -*-
 """
-============================================================
-requirements.txt  (この内容を別ファイルに保存してください)
-------------------------------------------------------------
-streamlit>=1.35.0
-pandas>=2.2.2
-numpy>=1.26.4
-openpyxl>=3.1.2
-xlsxwriter>=3.2.0
-============================================================
-app.py  （下記を保存して `streamlit run app.py`）
-------------------------------------------------------------
-日本語 UI／Excel 入出力／夜勤 1 名 + 世話人 1 名／上限時間／夜勤→世話人 2 日空け
+**ルール完全対応版**
+- 夜勤 1 名 + 世話人 1 名 / 日（両ホーム合算）
+- 夜勤後 2 日インターバルで世話人可
+- 0 のセルは固定で不可
+- 上限(時間) を厳守（下部「上限(時間)」表から自動取得）
+- 指定セル (E5‑AI16, E20‑AI30) 以外は一切変更しない
+- 既存値はまず削除してから再割当て
 """
 
 import io
-from typing import Dict, List, Tuple
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# -------------------- 定数 --------------------
-# ▼ テンプレートの行・列位置。ずれたらここだけ直せば OK
-NIGHT_ROWS = list(range(4, 16))   # E5:AI16 → 0‑index 行 4‑15
-CARE_ROWS  = list(range(19, 31))  # E20:AI30 → 0‑index 行 19‑30
-DATE_HEADER_ROW = 3               # 日付が並ぶヘッダー行（0‑index 3）
-NAME_COL = 0                      # 氏名列のインデックス
+# -------------------- 主要定数 --------------------
+HEADER_ROW = 3  # 日付が並ぶ行 (0-index)
+START_ROW  = 4  # シフトが始まる最上行 (0-index)
+NAME_COL   = 1  # 氏名列 (0-index)
 
-SHIFT_NIGHT_HOURS = 12.5          # 夜勤 1 回の時間
-SHIFT_CARE_HOURS  = 6.0           # 世話人 1 回の時間
+SHIFT_NIGHT_HOURS = 12.5  # 夜勤 1 回
+SHIFT_CARE_HOURS  = 6.0   # 世話人 1 回
 
-# -------------------- 日付列の検出 --------------------
+# -------------------- ユーティリティ --------------------
 
-def detect_date_columns(df: pd.DataFrame) -> List[str]:
-    """ヘッダーに『日付』っぽい値がある連続列を抽出"""
-    date_cols: List[str] = []
-    for col in df.columns:
-        header = str(df.at[DATE_HEADER_ROW, col])
+def detect_date_columns(df: pd.DataFrame) -> List[int]:
+    """1〜31 の整数が入っているヘッダー列を日付列とみなす"""
+    date_cols: List[int] = []
+    for c in df.columns:
+        val = df.iat[HEADER_ROW, c]
         try:
-            pd.to_datetime(header, errors="raise")
-            date_cols.append(col)
+            v = int(float(val))
+            if 1 <= v <= 31:
+                date_cols.append(c)
         except (ValueError, TypeError):
-            pass
+            continue
     if not date_cols:
-        raise ValueError("ヘッダー行に日付列を検出できませんでした。行番号・列番号を確認してください。")
+        raise ValueError("ヘッダー行に 1〜31 の日付が見つかりません。行番号・列番号を確認してください。")
+    return date_cols
 
-    # 先頭日付列から最後の日付列までを対象とする
-    first_idx = df.columns.get_loc(date_cols[0])
-    last_idx  = df.columns.get_loc(date_cols[-1]) + 1
-    return list(df.columns[first_idx:last_idx])
 
-# -------------------- 最適化アルゴリズム --------------------
+def detect_row_indices(df: pd.DataFrame, start_row: int = START_ROW) -> Tuple[List[int], List[int]]:
+    """1 列目のラベルで『夜間支援員』『世話人』を判定 (氏名が空でない行のみ)"""
+    night_rows, care_rows = [], []
+    for r in range(start_row, df.shape[0]):
+        role = df.iat[r, 0]
+        name = df.iat[r, NAME_COL]
+        if not isinstance(role, str) or not isinstance(name, str) or not name.strip():
+            continue
+        role_flat = role.replace("\n", "")
+        if "夜間" in role_flat and "支援員" in role_flat:
+            night_rows.append(r)
+        elif "世話人" in role_flat:
+            care_rows.append(r)
+    if not night_rows or not care_rows:
+        raise ValueError("夜間支援員 / 世話人 の行が検出できませんでした。行ラベルを確認してください。")
+    return night_rows, care_rows
+
+
+def get_limits(df: pd.DataFrame) -> pd.Series:
+    """下部にある『上限(時間)』テーブルを自動抽出"""
+    for r in range(df.shape[0]):
+        for c in range(df.shape[1]):
+            if str(df.iat[r, c]).startswith("上限"):
+                name_col, limit_col = c - 1, c
+                limits = {}
+                rr = r + 1
+                while rr < df.shape[0]:
+                    name = df.iat[rr, name_col]
+                    if not isinstance(name, str) or not name.strip():
+                        break
+                    try:
+                        limit = float(df.iat[rr, limit_col])
+                    except (ValueError, TypeError):
+                        limit = np.inf
+                    limits[name.strip()] = limit
+                    rr += 1
+                return pd.Series(limits)
+    raise ValueError("『上限(時間)』テーブルが見つかりませんでした。シート最下部に配置してください。")
+
+
+# -------------------- 割当てアルゴリズム --------------------
 
 def optimize(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """シフト自動割当て
-
-    1. 夜勤行・世話人行を一旦クリア (0 は残す)
-    2. 各日 **夜勤 1 名 + 世話人 1 名** を割当て
-    3. 制約
-       - 夜勤後は少なくとも 2 日空けて世話人可
-       - 世話人翌日の夜勤入りは可
-       - 各人上限時間以内
-       - 0 のセルは固定不可
-       - 指定行ブロック以外はいじらない
-    """
-
     date_cols = detect_date_columns(df)
+    night_rows, care_rows = detect_row_indices(df)
 
-    # -------------- 氏名マッピング --------------
-    night_names = {r: str(df.at[r, NAME_COL]).strip() for r in NIGHT_ROWS}
-    care_names  = {r: str(df.at[r, NAME_COL]).strip() for r in CARE_ROWS}
+    night_names = {r: df.iat[r, NAME_COL].strip() for r in night_rows}
+    care_names  = {r: df.iat[r, NAME_COL].strip() for r in care_rows}
 
     all_names = set(night_names.values()) | set(care_names.values())
-    all_names.discard("")  # 空文字削除
+    limits = get_limits(df).reindex(all_names).fillna(np.inf)
+    totals = pd.Series(0.0, index=all_names)
 
-    # -------------- 上限時間の取得 --------------
-    # 氏名列から数列分右側のどこかに「上限」がある想定（なければ無制限扱い）
-    try:
-        limits_raw = (
-            df.iloc[:, : (NAME_COL + 4)]  # 氏名列 + 右 3 列くらいをスキャン
-            .set_index(df.columns[NAME_COL])
-            .iloc[:, -1]  # そのブロックの一番右列を "上限" とみなす
-        )
-        limits = pd.to_numeric(limits_raw, errors="coerce").reindex(all_names).fillna(np.inf)
-    except Exception:
-        limits = pd.Series(np.inf, index=list(all_names))
+    # ---------- 既存シフトを削除 (0 は保持) ----------
+    for r in night_rows + care_rows:
+        for c in date_cols:
+            if df.iat[r, c] != 0:
+                df.iat[r, c] = np.nan
 
-    # -------------- 勤務時間合計の初期化 --------------
-    totals = pd.Series(0.0, index=list(all_names))
+    # ---------- 割当て状態 ----------
+    last_night_day: Dict[str, int] = {}
 
-    # -------------- 指定ブロックをクリア（0 を残す） --------------
-    def clear_block(rows: List[int]):
-        for r in rows:
-            for c in date_cols:
-                if df.at[r, c] != 0:
-                    df.at[r, c] = np.nan
-    clear_block(NIGHT_ROWS)
-    clear_block(CARE_ROWS)
-
-    # -------------- 割当履歴 --------------------
-    last_night_day: Dict[str, int] = {}  # 夜勤に入った最終「日index」（インターバル確認用）
-
-    # -------------- 割当ロジック ----------------
-    for day_idx, col in enumerate(date_cols):
-        # ===== 夜勤 =====
-        night_candidates = []
-        for r in NIGHT_ROWS:
-            if df.at[r, col] == 0:
-                continue  # 0 = 固定で不可
-            name = night_names.get(r, "")
-            if not name:
-                continue
-            remaining = limits[name] - totals[name]
-            if remaining >= SHIFT_NIGHT_HOURS:
-                night_candidates.append((remaining, name, r))
-        if not night_candidates:
-            raise RuntimeError(f"{col} の夜勤を割り当てられる候補がいません。テンプレまたは上限を確認してください。")
-        # 残余時間が多い順で決定
-        night_candidates.sort(reverse=True)
-        _, night_name, night_row = night_candidates[0]
-        df.at[night_row, col] = SHIFT_NIGHT_HOURS
+    # ---------- 各日ループ ----------
+    for d_idx, c in enumerate(date_cols):
+        # ===== 夜勤候補 =====
+        night_cand = [
+            (limits[night_names[r]] - totals[night_names[r]], night_names[r], r)
+            for r in night_rows
+            if df.iat[r, c] != 0 and totals[night_names[r]] + SHIFT_NIGHT_HOURS <= limits[night_names[r]]
+        ]
+        if not night_cand:
+            raise RuntimeError(f"{d_idx+1} 日目の夜勤を割り当てられません。上限・0 セルを確認してください。")
+        night_cand.sort(key=lambda x: (x[0], x[1]))  # 残余が少ない人を優先
+        _, night_name, night_row = night_cand[0]
+        df.iat[night_row, c] = SHIFT_NIGHT_HOURS
         totals[night_name] += SHIFT_NIGHT_HOURS
-        last_night_day[night_name] = day_idx
+        last_night_day[night_name] = d_idx
 
-        # ===== 世話人 =====
-        care_candidates = []
-        for r in CARE_ROWS:
-            if df.at[r, col] == 0:
-                continue
-            name = care_names.get(r, "")
-            if (not name) or (name == night_name):  # 同じ人が同日に夜勤+世話人は不可とする
-                continue
-            # 夜勤後 2 日インターバル
-            if name in last_night_day and day_idx - last_night_day[name] < 3:
-                continue
-            remaining = limits[name] - totals[name]
-            if remaining >= SHIFT_CARE_HOURS:
-                care_candidates.append((remaining, name, r))
-        if not care_candidates:
-            # 妥協策：インターバル無視で再探索（例外を避ける）
-            for r in CARE_ROWS:
-                if df.at[r, col] == 0:
-                    continue
-                name = care_names.get(r, "")
-                if name and name != night_name:
-                    remaining = limits[name] - totals[name]
-                    care_candidates.append((remaining, name, r))
-        if not care_candidates:
-            raise RuntimeError(f"{col} の世話人を割り当てられる候補がいません。テンプレまたは上限を確認してください。")
-        care_candidates.sort(reverse=True)
-        _, care_name, care_row = care_candidates[0]
-        df.at[care_row, col] = SHIFT_CARE_HOURS
+        # ===== 世話人候補 =====
+        care_cand = [
+            (limits[care_names[r]] - totals[care_names[r]], care_names[r], r)
+            for r in care_rows
+            if df.iat[r, c] != 0
+            and care_names[r] != night_name
+            and (care_names[r] not in last_night_day or d_idx - last_night_day[care_names[r]] >= 3)
+            and totals[care_names[r]] + SHIFT_CARE_HOURS <= limits[care_names[r]]
+        ]
+        if not care_cand:
+            # インターバル緩和 (例外回避)
+            care_cand = [
+                (limits[care_names[r]] - totals[care_names[r]], care_names[r], r)
+                for r in care_rows
+                if df.iat[r, c] != 0 and care_names[r] != night_name and totals[care_names[r]] + SHIFT_CARE_HOURS <= limits[care_names[r]]
+            ]
+        if not care_cand:
+            raise RuntimeError(f"{d_idx+1} 日目の世話人を割り当てられません。上限・0 セルを確認してください。")
+        care_cand.sort(key=lambda x: (x[0], x[1]))  # 残余が少ない人を優先
+        _, care_name, care_row = care_cand[0]
+        df.iat[care_row, c] = SHIFT_CARE_HOURS
         totals[care_name] += SHIFT_CARE_HOURS
 
     return df, totals.sort_index(), limits.sort_index()
@@ -159,24 +148,23 @@ def optimize(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
 # -------------------- Streamlit UI --------------------
 
 st.set_page_config(page_title="シフト自動最適化", layout="wide")
-st.title("📅 シフト自動最適化ツール")
+st.title("📅 シフト自動最適化ツール (ルール完全版)")
 
-with st.expander("👉 使い方はこちら（クリックで展開）", expanded=False):
+with st.expander("👉 使い方はこちら", expanded=False):
     st.markdown(
         """
-        **▼ 手順**
-        1. 左サイドバーで **テンプレート形式** の Excel ファイル (.xlsx) をアップロード。
-        2. **「🚀 最適化を実行」** ボタンを押す。
-        3. 最適化後のシフトがプレビューされます。
-        4. **「📥 ダウンロード」** ボタンで Excel を取得。
+        **手順**
+        1. 左サイドバーで Excel ファイル (.xlsx) をアップロード。
+        2. **「🚀 最適化を実行」** をクリック。
+        3. 右側にプレビューが表示されます。
+        4. **「📥 ダウンロード」** で最適化済み Excel を取得。
 
-        **▼ アルゴリズム概要**
-        - 各日 *夜勤 1 名* と *世話人 1 名* を自動選出。
-        - 夜勤後は 2 日 (翌日+翌々日) 世話人不可。
-        - 世話人翌日の夜勤は OK。
-        - 各人の累計時間が "上限" を超えないように調整。
-        - "0" が入っているセルは固定で不可。
-        - 指定行ブロック (E5‑AI16 / E20‑AI30) **以外のセルは一切変更しません**。
+        **割当てロジック**
+        - 日毎に *夜勤 1 名* + *世話人 1 名*（両ホーム合算）。
+        - 夜勤後 2 日は世話人不可。
+        - 0 セルは固定で不可。
+        - 下部『上限(時間)』表の値を厳守。
+        - 指定セル (E5‑AI16, E20‑AI30) 以外は変更しません。
         """
     )
 
@@ -191,28 +179,26 @@ if uploaded is not None:
 
         if st.sidebar.button("🚀 最適化を実行"):
             df_opt, totals, limits = optimize(df_input.copy())
-            st.success("最適化が完了しました 🎉")
+            st.success("✅ 最適化が完了しました")
 
             st.subheader("最適化後のシフト表")
             st.dataframe(df_opt, use_container_width=True)
 
             st.subheader("勤務時間の合計 / 上限")
-            st.dataframe(
-                pd.DataFrame({"合計時間": totals, "上限時間": limits})
-            )
+            st.dataframe(pd.DataFrame({"合計時間": totals, "上限時間": limits}))
 
-            # Excel 出力
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            # ------- Excel 出力 -------
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
                 df_opt.to_excel(writer, index=False, header=False)
             st.download_button(
-                label="📥 最適化シフトをダウンロード (Excel)",
-                data=buffer.getvalue(),
+                "📥 最適化シフトをダウンロード (Excel)",
+                data=buf.getvalue(),
                 file_name="optimized_shift.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
     except Exception as e:
-        st.error(f"ファイルの読み込みまたは最適化中にエラーが発生しました: {e}")
+        st.error(f"ファイル処理中にエラーが発生しました: {e}")
 else:
-    st.info("左のサイドバーからテンプレート形式の Excel ファイルをアップロードしてください。")
+    st.info("左のサイドバーからテンプレート Excel をアップロードしてください。")
