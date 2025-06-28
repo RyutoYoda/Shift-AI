@@ -5,6 +5,7 @@ import docx
 import openai
 import streamlit as st
 from io import BytesIO
+import re
 
 # --- GPT API設定（サイドバー） ---
 st.sidebar.title("設定")
@@ -12,28 +13,48 @@ api_key = st.sidebar.text_input("OpenAI APIキーを入力", type="password")
 if not api_key:
     st.warning("APIキーをサイドバーに入力してください")
     st.stop()
-client = openai.OpenAI(api_key=api_key)
+openai.api_key = api_key
 
 # --- Wordから勤務ルールを抽出する関数 ---
 def extract_text_from_docx(file):
     doc = docx.Document(file)
     return "\n".join([para.text for para in doc.paragraphs if para.text.strip() != ""])
 
-def parse_rules_from_gpt(doc_text):
+# --- スタッフ情報を構造化テーブルに変換する関数 ---
+def convert_to_structured_table(text):
+    staff_blocks = re.split(r'(?=\n?[^\s\n]{2,}\n①|\n?[^\s\n]{2,}\n②)', text)
+    table = []
+    for block in staff_blocks:
+        lines = block.strip().split("\n")
+        if len(lines) < 2:
+            continue
+        name = lines[0].strip()
+        assign = lines[1].strip()
+        notes = " ".join(lines[2:]).strip()
+        row = {
+            "名前": name,
+            "配属": assign,
+            "条件": notes
+        }
+        table.append(row)
+    df = pd.DataFrame(table)
+    return df
+
+def parse_rules_from_gpt(structured_text):
     system_prompt = """
-    以下の勤務ルールから、各スタッフの勤務可能条件をJSON形式で出力してください。
-    スタッフ名をキーとして、home（①/②）、世話人可否、夜勤可否、上限時間（単位:時間）、曜日指定、特記事項などをまとめてください。
+    以下のスタッフ条件表を読み取り、各スタッフの勤務可能条件をJSON形式で出力してください。
+    キーはスタッフ名、値はhome、世話人可否、夜勤可否、勤務可能曜日、上限時間、特記事項です。
     """
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": doc_text}
+        {"role": "user", "content": structured_text}
     ]
-    response = client.chat.completions.create(
+    response = openai.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=messages,
         temperature=0
     )
-    return eval(response.choices[0].message.content)  # JSON文字列がPython dictとして出力される前提
+    return eval(response.choices[0].message.content)
 
 # --- Streamlit UI ---
 st.title("すまいるシフト自動作成アプリ（GPT連携版）")
@@ -43,10 +64,14 @@ docx_file = st.file_uploader("スタッフルール（Word）をアップロー�
 
 if excel_file and docx_file:
     df = pd.read_excel(excel_file, sheet_name=0, header=None)
-    doc_text = extract_text_from_docx(docx_file)
+    raw_text = extract_text_from_docx(docx_file)
+    structured_df = convert_to_structured_table(raw_text)
+    st.markdown("### 構造化されたスタッフ表")
+    st.dataframe(structured_df)
 
     with st.spinner("GPTでスタッフルール解析中..."):
-        staff_rules = parse_rules_from_gpt(doc_text)
+        structured_text = structured_df.to_string(index=False)
+        staff_rules = parse_rules_from_gpt(structured_text)
         st.success("スタッフルールを解析しました")
         st.json(staff_rules)
 
