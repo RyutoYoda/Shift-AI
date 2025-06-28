@@ -12,7 +12,7 @@ api_key = st.sidebar.text_input("OpenAI APIキーを入力", type="password")
 if not api_key:
     st.warning("APIキーをサイドバーに入力してください")
     st.stop()
-openai.api_key = api_key
+client = openai.OpenAI(api_key=api_key)
 
 # --- Wordから勤務ルールを抽出する関数 ---
 def extract_text_from_docx(file):
@@ -28,12 +28,12 @@ def parse_rules_from_gpt(doc_text):
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": doc_text}
     ]
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=messages,
         temperature=0
     )
-    return eval(response["choices"][0]["message"]["content"])  # JSON文字列がPython dictとして出力される前提
+    return eval(response.choices[0].message.content)  # JSON文字列がPython dictとして出力される前提
 
 # --- Streamlit UI ---
 st.title("すまいるシフト自動作成アプリ（GPT連携版）")
@@ -44,7 +44,7 @@ docx_file = st.file_uploader("スタッフルール（Word）をアップロー�
 if excel_file and docx_file:
     df = pd.read_excel(excel_file, sheet_name=0, header=None)
     doc_text = extract_text_from_docx(docx_file)
-    
+
     with st.spinner("GPTでスタッフルール解析中..."):
         staff_rules = parse_rules_from_gpt(doc_text)
         st.success("スタッフルールを解析しました")
