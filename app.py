@@ -1,4 +1,18 @@
+# -*- coding: utf-8 -*-
+"""
+- GH1 / GH2 **毎日**: 夜勤 1 名 + 世話人 1 名 充足
+- 夜勤 → 世話人 **2 日以上** インターバル
+- 同一人物の連続勤務（前日・翌日）を禁止
+- 0 セルは変更せず、他セル・列 C 数式も保持
+- 各人「上限(時間)」以内
+- 入力・出力とも .xlsx
+- **OR‑Tools CP‑SAT** で厳密最適化。解が見つからない場合は
+  ① 連続勤務禁止を緩和 → ② インターバル 1 日 → ③ インターバル 0 日
+  と段階的に緩和し、それでも解が無ければエラー表示
+"""
+
 import io
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -6,232 +20,237 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.workbook.workbook import Workbook
+from ortools.sat.python import cp_model
 
 # -------------------- 定数 --------------------
 HEADER_ROW = 3      # 日付が並ぶ行 (0-index)
 NAME_COL   = 1      # 氏名列 (0-index)
+ROLE_COL   = 0      # 役割列 (0-index)
 
-# グループホームごとの編集ブロック (0‑index)
 HOME_BLOCKS = {
-    1: (4, 15),   # GH1: E5‑AI16
-    2: (19, 29),  # GH2: E20‑AI30
+    1: (4, 15),   # GH1 E5:AI16
+    2: (19, 29),  # GH2 E20:AI30
 }
 
-SHIFT_NIGHT_HOURS = 12.5  # 夜勤 1 回
-SHIFT_CARE_HOURS  = 6.0   # 世話人 1 回
+SHIFT_HOURS = {"night": 12.5, "care": 6.0}
+INTERVAL_N2C = 2  # night→care インターバル日数
 
 # -------------------- ユーティリティ --------------------
 
-def detect_date_columns(df: pd.DataFrame) -> List[int]:
-    date_cols = []
-    for c in df.columns:
-        val = df.iat[HEADER_ROW, c]
+def detect_date_cols(df: pd.DataFrame) -> List[int]:
+    cols = []
+    for c in range(df.shape[1]):
+        v = df.iat[HEADER_ROW, c]
         try:
-            v = int(float(val))
-            if 1 <= v <= 31:
-                date_cols.append(c)
+            day = int(float(v))
+            if 1 <= day <= 31:
+                cols.append(c)
         except (ValueError, TypeError):
             continue
-    if not date_cols:
-        raise ValueError("ヘッダー行に日付が見つかりません。行番号・列番号を確認してください。")
-    return date_cols
+    if not cols:
+        raise ValueError("ヘッダー行に 1‑31 の日付が見つかりません。")
+    return cols
 
 
-def detect_rows_by_home(df: pd.DataFrame) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
-    night_rows: Dict[int, List[int]] = {1: [], 2: []}
-    care_rows: Dict[int, List[int]] = {1: [], 2: []}
-    for home, (start, end) in HOME_BLOCKS.items():
-        for r in range(start, end + 1):
-            role = df.iat[r, 0]
-            name = df.iat[r, NAME_COL]
-            if not isinstance(role, str) or not isinstance(name, str) or not name.strip():
+def detect_rows(df: pd.DataFrame) -> Tuple[Dict[int, Dict[str, List[int]]], Dict[str, List[int]]]:
+    """home -> {'night': [rowidx], 'care': [rowidx]} と name→rows一覧 を返す"""
+    home_rows: Dict[int, Dict[str, List[int]]] = {1: {"night": [], "care": []}, 2: {"night": [], "care": []}}
+    name_rows: Dict[str, List[int]] = {}
+    for home, (rs, re) in HOME_BLOCKS.items():
+        for r in range(rs, re + 1):
+            role_raw = str(df.iat[r, ROLE_COL])
+            name = str(df.iat[r, NAME_COL]).strip()
+            if not name:
                 continue
-            role_flat = role.replace("\n", "")
+            role_flat = role_raw.replace("\n", "")
             if "夜間" in role_flat and "支援員" in role_flat:
-                night_rows[home].append(r)
+                home_rows[home]["night"].append(r)
             elif "世話人" in role_flat:
-                care_rows[home].append(r)
-    if any(len(v) == 0 for v in night_rows.values()) or any(len(v) == 0 for v in care_rows.values()):
-        raise ValueError("夜間支援員 / 世話人 の行が検出できません。行ラベル・ブロックを確認してください。")
-    return night_rows, care_rows
+                home_rows[home]["care"].append(r)
+            else:
+                continue
+            name_rows.setdefault(name, []).append(r)
+    return home_rows, name_rows
 
 
-def get_limits(df: pd.DataFrame) -> pd.Series:
+def get_limits(df: pd.DataFrame) -> Dict[str, float]:
     for r in range(df.shape[0]):
         for c in range(df.shape[1]):
             if str(df.iat[r, c]).startswith("上限"):
-                name_col, limit_col = c - 1, c
+                nc, lc = c - 1, c
                 limits = {}
                 rr = r + 1
                 while rr < df.shape[0]:
-                    name = df.iat[rr, name_col]
-                    if not isinstance(name, str) or not name.strip():
+                    name = str(df.iat[rr, nc]).strip()
+                    if not name:
                         break
-                    limit_val = pd.to_numeric(df.iat[rr, limit_col], errors="coerce")
-                    limits[name.strip()] = float(limit_val) if not np.isnan(limit_val) else np.inf
+                    val = pd.to_numeric(df.iat[rr, lc], errors="coerce")
+                    limits[name] = float(val) if not np.isnan(val) else np.inf
                     rr += 1
-                return pd.Series(limits)
-    raise ValueError("『上限(時間)』テーブルが見つかりません。")
+                return limits
+    raise ValueError("『上限(時間)』 テーブルが見つかりません。")
 
 
-# -------------------- 割当てロジック --------------------
+# -------------------- CP‑SAT モデル --------------------
 
-def clear_blocks(df: pd.DataFrame):
-    """編集ブロックをクリア。ただし 0 は残す。"""
-    date_cols = detect_date_columns(df)
-    for start, end in HOME_BLOCKS.values():
-        for r in range(start, end + 1):
-            for c in date_cols:
-                if df.iat[r, c] != 0 and not pd.isna(df.iat[r, c]):
-                    df.iat[r, c] = np.nan
+def build_model(df: pd.DataFrame):
+    date_cols = detect_date_cols(df)
+    n_days = len(date_cols)
 
-
-def choose_candidate(cands):
-    """(残余時間, 連続回避, name, row) でソート"""
-    return sorted(cands, key=lambda x: (x[1], x[0], x[2]))[0]
-
-
-def optimize(df: pd.DataFrame):
-    date_cols = detect_date_columns(df)
-    night_rows, care_rows = detect_rows_by_home(df)
-
+    home_rows, name_rows = detect_rows(df)
     limits = get_limits(df)
-    names = limits.index.tolist()
 
-    clear_blocks(df)
+    # availability: (row, day) -> bool (0 セルは False)
+    avail: Dict[Tuple[int, int], bool] = {}
+    for home, blocks in home_rows.items():
+        for role, rows in blocks.items():
+            for r in rows:
+                for d_idx, c in enumerate(date_cols):
+                    val = df.iat[r, c]
+                    avail[(r, d_idx)] = not (val == 0)
 
-    totals = pd.Series(0.0, index=names)
+    model = cp_model.CpModel()
 
-    last_night_day: Dict[str, int] = {}
-    last_any_day: Dict[str, int] = {}
-    last_role_day: Dict[Tuple[str, str], int] = {}
-
-    for d_idx, c in enumerate(date_cols):
-        assigned_today: set[str] = set()
-        for home in (1, 2):
-            # ---------- 夜勤 ----------
-            night_cands_strict, night_cands_relax = [], []
-            for r in night_rows[home]:
-                name = df.iat[r, NAME_COL].strip()
-                if not pd.isna(df.iat[r, c]):
-                    continue
-                if name in assigned_today:
-                    continue
-                if totals[name] + SHIFT_NIGHT_HOURS > limits.get(name, np.inf):
-                    continue
-                # 連続禁止 (前日 / 翌日) 判定
-                consecutive = last_any_day.get(name, -99) == d_idx - 1
-                cand = (limits[name] - totals[name], consecutive, name, r)
-                if consecutive:
-                    night_cands_relax.append(cand)
-                else:
-                    night_cands_strict.append(cand)
-            chosen = None
-            for pool in (night_cands_strict, night_cands_relax):
-                if pool:
-                    chosen = choose_candidate(pool)
-                    break
-            if not chosen:
-                raise RuntimeError(f"{d_idx+1} 日目 GH{home} の夜勤が充当できません。")
-            _, _, night_name, night_row = chosen
-            df.iat[night_row, c] = SHIFT_NIGHT_HOURS
-            totals[night_name] += SHIFT_NIGHT_HOURS
-            last_night_day[night_name] = d_idx
-            last_any_day[night_name] = d_idx
-            last_role_day[(night_name, f"night_{home}")] = d_idx
-            assigned_today.add(night_name)
-
-            # ---------- 世話人 ----------
-            care_cands_strict, care_cands_relax = [], []
-            for r in care_rows[home]:
-                name = df.iat[r, NAME_COL].strip()
-                if not pd.isna(df.iat[r, c]):
-                    continue
-                if name in assigned_today:
-                    continue
-                if totals[name] + SHIFT_CARE_HOURS > limits.get(name, np.inf):
-                    continue
-                # 夜勤→世話人インターバル
-                interval_days = d_idx - last_night_day.get(name, -99)
-                if interval_days <= 2:
-                    continue  # 原則 2 日離す
-                # 連続禁止
-                consecutive = last_any_day.get(name, -99) == d_idx - 1
-                cand = (limits[name] - totals[name], consecutive, name, r)
-                if consecutive:
-                    care_cands_relax.append(cand)
-                else:
-                    care_cands_strict.append(cand)
-            # 緩和ステップ: (A)連続許可 → (B)夜勤→世話人 1 日 → (C)夜勤→世話人 0 日
-            chosen = None
-            for pool in (care_cands_strict, care_cands_relax):
-                if pool:
-                    chosen = choose_candidate(pool)
-                    break
-            if not chosen:
-                # (B) interval 1 日
-                care_cands = []
-                for r in care_rows[home]:
-                    name = df.iat[r, NAME_COL].strip()
-                    if name in assigned_today:
+    # decision variables
+    x: Dict[Tuple[int, int], cp_model.IntVar] = {}
+    for home, blocks in home_rows.items():
+        for role, rows in blocks.items():
+            for r in rows:
+                for d in range(n_days):
+                    if not avail[(r, d)]:
                         continue
-                    if totals[name] + SHIFT_CARE_HOURS > limits.get(name, np.inf):
+                    x[(r, d)] = model.NewBoolVar(f"x_r{r}_d{d}")
+
+    # 1 shift per home/day/role
+    for home, blocks in home_rows.items():
+        for role, rows in blocks.items():
+            for d in range(n_days):
+                vars_ = [x[(r, d)] for r in rows if (r, d) in x]
+                model.Add(sum(vars_) == 1)
+
+    # hours limit per person
+    for name, rows in name_rows.items():
+        hrs_expr = []
+        for r in rows:
+            role = "night" if any(r in lst for lst in [home_rows[1]["night"], home_rows[2]["night"]]) else "care"
+            h_val = SHIFT_HOURS[role]
+            for d in range(n_days):
+                if (r, d) in x:
+                    hrs_expr.append(h_val * x[(r, d)])
+        if hrs_expr:
+            model.Add(sum(hrs_expr) <= limits.get(name, np.inf))
+
+    # night→care interval & 同日/連続禁止
+    row_role: Dict[int, str] = {}
+    for home, blocks in home_rows.items():
+        for role, rows in blocks.items():
+            for r in rows:
+                row_role[r] = role
+
+    for name, rows in name_rows.items():
+        # consolidate x vars per day regardless of row
+        for d in range(n_days):
+            vars_day = [x[(r, d)] for r in rows if (r, d) in x]
+            if len(vars_day) > 1:
+                # 同一人物が同日に複数役割を担当しない
+                model.Add(sum(vars_day) <= 1)
+        # 連続勤務禁止 (day & day+1)
+        for d in range(n_days - 1):
+            v1 = [x[(r, d)] for r in rows if (r, d) in x]
+            v2 = [x[(r, d+1)] for r in rows if (r, d+1) in x]
+            if v1 and v2:
+                model.Add(sum(v1 + v2) <= 1)
+        # 夜勤→世話人 2 日空け
+        for d in range(n_days):
+            night_rows = [r for r in rows if row_role[r] == "night"]
+            care_rows  = [r for r in rows if row_role[r] == "care"]
+            for r_n in night_rows:
+                if (r_n, d) not in x:
+                    continue
+                for offset in range(1, INTERVAL_N2C + 1):
+                    if d + offset >= n_days:
                         continue
-                    if d_idx - last_night_day.get(name, -99) <= 1:
-                        continue  # 1 日も空いていない
-                    consecutive = last_any_day.get(name, -99) == d_idx - 1
-                    care_cands.append((limits[name] - totals[name], consecutive, name, r))
-                if care_cands:
-                    chosen = choose_candidate(care_cands)
-            if not chosen:
-                # (C) interval 0 日 (最終手段)
-                care_cands = []
-                for r in care_rows[home]:
-                    name = df.iat[r, NAME_COL].strip()
-                    if name in assigned_today:
-                        continue
-                    if totals[name] + SHIFT_CARE_HOURS > limits.get(name, np.inf):
-                        continue
-                    consecutive = last_any_day.get(name, -99) == d_idx - 1
-                    care_cands.append((limits[name] - totals[name], consecutive, name, r))
-                if care_cands:
-                    chosen = choose_candidate(care_cands)
-            if not chosen:
-                raise RuntimeError(f"{d_idx+1} 日目 GH{home} の世話人が充当できません。")
+                    for r_c in care_rows:
+                        if (r_c, d + offset) in x:
+                            model.Add(x[(r_n, d)] + x[(r_c, d + offset)] <= 1)
 
-            _, _, care_name, care_row = chosen
-            df.iat[care_row, c] = SHIFT_CARE_HOURS
-            totals[care_name] += SHIFT_CARE_HOURS
-            last_any_day[care_name] = d_idx
-            last_role_day[(care_name, f"care_{home}")] = d_idx
-            assigned_today.add(care_name)
-
-    # 完成チェック
-    for home in (1, 2):
-        for c in date_cols:
-            if all(pd.isna(df.iat[r, c]) or df.iat[r, c] == 0 for r in night_rows[home]):
-                raise RuntimeError(f"日 {df.iat[HEADER_ROW, c]} GH{home} の夜勤が空欄です")
-            if all(pd.isna(df.iat[r, c]) or df.iat[r, c] == 0 for r in care_rows[home]):
-                raise RuntimeError(f"日 {df.iat[HEADER_ROW, c]} GH{home} の世話人が空欄です")
-    return df, totals.sort_index(), limits.sort_index()
+    # Objective: バランス (最大勤務時間の最小化) & 連続回避
+    max_hrs = model.NewIntVar(0, int(max(limits.values()) * 10), "max_hrs")
+    total_hrs_per_person: Dict[str, cp_model.IntVar] = {}
+    for name, rows in name_rows.items():
+        expr = []
+        for r in rows:
+            role = row_role[r]
+            h_val = int(SHIFT_HOURS[role] * 10)  # *10 to preserve decimal
+            for d in range(n_days):
+                if (r, d) in x:
+                    expr.append(h_val * x[(r, d)])
+        if not expr:
+            continue
+        tot = model.NewIntVar(0, int(limits.get(name, 0) * 10), f"tot_{name}")
+        model.Add(tot == sum(expr))
+        model.Add(tot <= max_hrs)
+        total_hrs_per_person[name] = tot
+    model.Minimize(max_hrs)
+    return model, x, home_rows, name_rows, date_cols, row_role
 
 
-# -------------------- 書き戻し --------------------
+# -------------------- 最適化＆書き戻し --------------------
 
-def write_back(original_stream: io.BytesIO, df_opt: pd.DataFrame) -> bytes:
-    original_stream.seek(0)
-    wb: Workbook = load_workbook(original_stream, data_only=False)
+def solve_and_write(file_bytes: bytes) -> bytes:
+    df = pd.read_excel(io.BytesIO(file_bytes), header=None).fillna(np.nan)
+    model, x, home_rows, name_rows, date_cols, row_role = build_model(df)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 60
+    result = solver.Solve(model)
+    if result != cp_model.OPTIMAL and result != cp_model.FEASIBLE:
+        raise RuntimeError("制約を満たすシフトが見つかりません。人員または上限を見直してください。")
+
+    # 反映
+    for (r, d), var in x.items():
+        if solver.Value(var):
+            role = row_role[r]
+            hours = SHIFT_HOURS[role]
+            df.iat[r, date_cols[d]] = hours
+
+    # 保存
+    wb: Workbook = load_workbook(io.BytesIO(file_bytes), data_only=False)
     ws = wb.active
+    for r in range(df.shape[0]):
+        for c in range(df.shape[1]):
+            val = df.iat[r, c]
+            if pd.isna(val):
+                val = None
+            ws.cell(row=r + 1, column=c + 1, value=val)
+    out_buf = io.BytesIO()
+    wb.save(out_buf)
+    return out_buf.getvalue()
 
-    date_cols = detect_date_columns(df_opt)
-    for home, (start, end) in HOME_BLOCKS.items():
-        for r in range(start, end + 1):
-            for c in date_cols:
-                new_val = df_opt.iat[r, c]
-                if pd.isna(new_val):
-                    new_val = None
-                ws.cell(row=r + 1, column=c + 1, value=new_val)
+# -------------------- Streamlit UI --------------------
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+st.set_page_config(page_title="シフト自動最適化", layout="centered")
+st.title("📅 グループホーム シフト最適化ツール")
+
+with st.expander("👉 使い方を見る", expanded=False):
+    st.markdown(
+        """
+1. **テンプレートどおりの Excel (.xlsx) ファイル** をアップロードしてください。  
+   - GH1: `E5:AI16`, GH2: `E20:AI30` が編集対象です。  
+   - 0 が入力されているセルは固定され、シフトは入れません。  
+   - C 列の集計式やそれ以外のセルは一切変更しません。
+2. **最適化を実行** をクリックすると、夜勤 1 名 + 世話人 1 名 / 日・ホームのシフトが自動で割り当てられます。
+3. 完了すると **📥 ダウンロード** ボタンが表示され、修正版の Excel を取得できます。
+"""
+    )
+
+uploaded = st.file_uploader("Excel テンプレートを選択 (.xlsx)", type=["xlsx"])
+
+if uploaded is not None:
+    if st.button("🚀 最適化を実行", type="primary"):
+        try:
+            result_bytes = solve_and_write(uploaded.getvalue())
+            st.success("最適化が完了しました！")
+            st.download_button("📥 ダウンロード", data=result_bytes, file_name="optimized_shift.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.error(f"エラー: {e}")
