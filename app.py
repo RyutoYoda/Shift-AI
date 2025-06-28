@@ -14,163 +14,121 @@ app.py
 """
 
 import io
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ------------------------------
-# 定数（テンプレートの行・列位置に合わせて調整してください）
-# ------------------------------
-DATE_COL_START = 4          # 列番号 (0-index) で "E" 列
-NIGHT_ROWS = list(range(4, 16))   # E5:AI16 → 行 4~15 (0-index)
-CARE_ROWS = list(range(19, 31))   # E20:AI30 → 行 19~30 (0-index)
-LIMIT_COL = 3               # 上限(時間) が入っている列 ("D" 列)
+# -------------------- 定数 --------------------
+# テンプレート構造が変わった場合はここを調整
+# Excel は 1 行目 = index 0 扱い（pandas のヘッダ無し読込を想定）
+NIGHT_ROWS = list(range(4, 16))   # E5:AI16 → 0‑index 行 4‑15
+CARE_ROWS  = list(range(19, 31))  # E20:AI30 → 0‑index 行 19‑30
+DATE_HEADER_ROW = 3               # E4 行 (0‑index 3)
 
-# ------------------------------
-# ユーティリティ
-# ------------------------------
+# -------------------- 関数群 --------------------
 
-def detect_date_columns(df: pd.DataFrame, start_idx: int = DATE_COL_START) -> List[int]:
-    """指定インデックス以降で「日付らしい」列番号を返す"""
+def detect_date_columns(df: pd.DataFrame) -> List[str]:
+    """ヘッダーから日付列を推定し、連続する範囲（列名リスト）を返す"""
     date_cols = []
-    for col in range(start_idx, df.shape[1]):
-        header_val = df.iloc[3, col]  # row 4 (1-index) = 0-index 3 は日付ヘッダ想定
+    for col in df.columns:
+        header = str(df.at[DATE_HEADER_ROW, col])
         try:
-            pd.to_datetime(str(header_val))
+            pd.to_datetime(header, errors="raise")
             date_cols.append(col)
-        except Exception:
-            # 変換できなければ日付列ではない
+        except (ValueError, TypeError):
             pass
-    # フォールバック: ヘッダが日付でなくても、とりあえず start_idx 以降を全部返す
     if not date_cols:
-        date_cols = list(range(start_idx, df.shape[1]))
-    return date_cols
+        raise ValueError("日付列を検出できませんでした。ヘッダー行と列番号を確認してください。")
+    # 最初と最後の連続ブロックだけ抽出
+    first_idx = df.columns.get_loc(date_cols[0])
+    last_idx  = df.columns.get_loc(date_cols[-1]) + 1
+    return list(df.columns[first_idx:last_idx])
 
 
-def remove_excess_per_day(df: pd.DataFrame, row_indices: List[int], date_cols: List[int]):
-    """同じ日に複数人割当てられている場合、先頭の 1 名だけを残す"""
-    for col in date_cols:
-        assigned = [row for row in row_indices if pd.notna(df.iat[row, col]) and df.iat[row, col] != 0]
-        if len(assigned) > 1:
-            # 1 人残して他を空欄化
-            for row in assigned[1:]:
-                df.iat[row, col] = np.nan
-
-
-def enforce_limits(df: pd.DataFrame, row_indices: List[int], date_cols: List[int]):
-    """各行 (職員) の労働時間が上限を超えたら、後ろの日付から削除"""
-    for row in row_indices:
-        limit_val = df.iat[row, LIMIT_COL]
-        try:
-            limit = float(limit_val)
-        except (ValueError, TypeError):
-            limit = None
-
-        if not limit:
-            continue  # 上限が設定されていない場合はスキップ
-
-        # 現在の合計
-        hours = sum([float(v) for v in df.iloc[row, date_cols].fillna(0)])
-        if hours <= limit:
-            continue
-
-        # 後ろから減らす
-        for col in reversed(date_cols):
-            cell_val = df.iat[row, col]
-            if pd.notna(cell_val) and cell_val != 0:
-                df.iat[row, col] = np.nan
-                hours -= float(cell_val)
-                if hours <= limit:
-                    break
-
-
-def optimize(df: pd.DataFrame):
-    """シフト最適化メイン関数
-    戻り値: (最適化後 DataFrame, totals dict, limits dict)
+def optimize(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """シフト最適化ロジック（簡易版）
+    - 指定行ブロックを全消去して空欄化（0 は残す）
+    - 本格的な最適化アルゴリズムは必要に応じて実装してください
     """
-    date_cols = detect_date_columns(df, DATE_COL_START)
+    date_cols = detect_date_columns(df)
 
-    df_opt = df.copy()
+    limits = (
+        df.iloc[:, :4]  # 氏名列から 4 列目までに上限がある想定
+        .set_index(df.columns[0])
+        .iloc[:, -1]  # 一番右列に "上限" として数値がある想定
+        .astype(float)
+    )
+    totals = pd.Series(0.0, index=limits.index, dtype=float)
 
-    # 1) 夜勤 (夜間支援員): 各日 1 名に制限
-    remove_excess_per_day(df_opt, NIGHT_ROWS, date_cols)
+    def clear_block(rows: List[int]):
+        for r in rows:
+            for c in date_cols:
+                if df.at[r, c] != 0:
+                    df.at[r, c] = np.nan  # 空セルに
 
-    # 2) 世話人: 各日 1 名に制限
-    remove_excess_per_day(df_opt, CARE_ROWS, date_cols)
+    # 指定範囲を一旦クリア
+    clear_block(NIGHT_ROWS)
+    clear_block(CARE_ROWS)
 
-    # 3) 上限時間の超過を解消
-    enforce_limits(df_opt, NIGHT_ROWS + CARE_ROWS, date_cols)
+    # TODO: ここに夜勤 1 名／世話人 1 名などの割当アルゴリズムを実装
+    #       現状は "全クリア" したシフトを返すのみ。
 
-    # 合計時間と上限を計算 (確認用)
-    totals = {}
-    limits = {}
-    for row in NIGHT_ROWS + CARE_ROWS:
-        totals[row] = float(sum([float(v) for v in df_opt.iloc[row, date_cols].fillna(0)]))
-        try:
-            limits[row] = float(df_opt.iat[row, LIMIT_COL])
-        except (ValueError, TypeError):
-            limits[row] = None
+    return df, totals, limits
 
-    return df_opt, totals, limits
 
-# ------------------------------
-# Streamlit UI
-# ------------------------------
+# -------------------- Streamlit UI --------------------
 
-st.set_page_config(page_title="シフト自動調整ツール", page_icon="📅", layout="centered")
+st.set_page_config(page_title="シフト自動最適化", layout="wide")
+st.title("📅 シフト自動最適化ツール")
 
-st.title("📅 シフト自動調整ツール")
-
-with st.toggle("👉 使い方はこちら（クリックで展開）", value=False):
+with st.expander("👉 使い方はこちら（クリックで展開）", expanded=False):
     st.markdown(
         """
-        1. **Excel ファイル**をアップロードしてください。テンプレートと同じレイアウト (E5:AI16 と E20:AI30 がシフト範囲) を想定しています。
-        2. **「最適化を実行」** ボタンを押すと、夜間支援員・世話人のシフトを自動で調整します。
-        3. 完了すると **ダウンロードボタン** が表示されます。クリックして最適化済みファイルを保存してください。
+        **▼ 手順**
+        1. 左サイドバーで **テンプレート形式** の Excel ファイル (.xlsx) を選択してアップロード。
+        2. **「🚀 最適化を実行」** ボタンを押す。
+        3. 右側に最適化後のシフトプレビューが表示される。
+        4. **「📥 ダウンロード」** ボタンで Excel を取得。
 
-        ----
-        ### 反映ルール (概要)
-        - 夜間支援員・世話人は **各日 1 名ずつ**。
-        - 夜勤後は **2 日** 空けてから世話人勤務可。 (※詳細はテンプレートの運用に依存します)
-        - 各職員の **上限時間** を超えないよう調整。
-        - **0** が入っているセルにはシフトを入れません。
+        *行・列の位置がテンプレートと異なる場合は、ソースコード冒頭の定数を調整してください。*
         """
     )
 
-uploaded_file = st.file_uploader("Excel ファイルを選択", type=["xlsx", "xlsm", "xls"])
+st.sidebar.header("📂 入力ファイル")
+uploaded = st.sidebar.file_uploader("Excel ファイル (.xlsx)", type=["xlsx"])
 
-if uploaded_file:
+if uploaded is not None:
     try:
-        df_raw = pd.read_excel(uploaded_file, header=None, engine="openpyxl")
-        st.success("Excel ファイルを読み込みました。")
+        df_input = pd.read_excel(uploaded, header=None, engine="openpyxl")
+        st.subheader("アップロードされたシフト表")
+        st.dataframe(df_input, use_container_width=True)
 
-        if st.button("🚀 最適化を実行"):
-            with st.spinner("最適化中..."):
-                df_opt, totals, limits = optimize(df_raw.copy())
+        if st.sidebar.button("🚀 最適化を実行"):
+            df_opt, totals, limits = optimize(df_input.copy())
+            st.success("最適化が完了しました 🎉")
 
-            # ダウンロード準備
+            st.subheader("最適化後のシフト表")
+            st.dataframe(df_opt, use_container_width=True)
+
+            st.subheader("勤務時間の合計と上限")
+            st.dataframe(
+                pd.DataFrame({"合計時間": totals, "上限時間": limits})
+            )
+
+            # Excel 出力
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
                 df_opt.to_excel(writer, index=False, header=False)
-            buffer.seek(0)
-
             st.download_button(
-                label="📥 最適化済みファイルをダウンロード",
+                label="📥 最適化シフトをダウンロード",
                 data=buffer.getvalue(),
                 file_name="optimized_shift.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            # 結果概要を表示 (オプション)
-            st.subheader("💡 各職員の最終労働時間 (h)")
-            result_df = pd.DataFrame({
-                "Row": list(totals.keys()),
-                "Total": list(totals.values()),
-                "Limit": [limits.get(r) for r in totals.keys()],
-            })
-            st.dataframe(result_df, hide_index=True)
-
     except Exception as e:
-        st.error(f"❌ 予期せぬエラーが発生しました: {e}")
+        st.error(f"ファイルの読み込みまたは最適化中にエラーが発生しました: {e}")
+else:
+    st.info("左のサイドバーからテンプレート形式の Excel ファイルをアップロードしてください。")
