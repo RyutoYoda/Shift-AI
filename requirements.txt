@@ -1,6 +1,4 @@
-pandas
-openai
-python-docx
-streamlit
-xlsxwriter
-openpyxl
+streamlit>=1.35
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1
