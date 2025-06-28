@@ -39,29 +39,37 @@ def optimize(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
     """
     date_cols = detect_date_columns(df)
 
-    limits = (
-        df.iloc[:, :4]  # 氏名列から 4 列目までに上限がある想定
-        .set_index(df.columns[0])
-        .iloc[:, -1]  # 一番右列に "上限" として数値がある想定
-        .astype(float)
-    )
+    # -------------------- 勤務時間上限の取得 --------------------
+    # Excel テンプレート左端付近に「上限」列があると仮定
+    # 文字列を float 化しようとして失敗するケースに備え、数値以外は NaN にする
+    try:
+        limits_raw = (
+            df.iloc[:, :4]  # 氏名列を含むブロック（列 0‑3 想定）
+            .set_index(df.columns[0])
+            .iloc[:, -1]   # そのブロックの一番右列に "上限" がある想定
+        )
+        limits = pd.to_numeric(limits_raw, errors="coerce")  # ← 文字列は NaN
+        limits = limits.dropna()
+    except Exception:
+        limits = pd.Series(dtype=float)
+
+    # totals は後段のアルゴリズム実装用のダミー（現状は全 0）
     totals = pd.Series(0.0, index=limits.index, dtype=float)
 
+    # -------------------- 指定ブロックのクリア --------------------
     def clear_block(rows: List[int]):
         for r in rows:
             for c in date_cols:
-                if df.at[r, c] != 0:
-                    df.at[r, c] = np.nan  # 空セルに
+                if df.at[r, c] != 0:  # 0 は "固定で不可" の意味なので維持
+                    df.at[r, c] = np.nan  # 空セル化
 
-    # 指定範囲を一旦クリア
     clear_block(NIGHT_ROWS)
     clear_block(CARE_ROWS)
 
-    # TODO: ここに夜勤 1 名／世話人 1 名などの割当アルゴリズムを実装
-    #       現状は "全クリア" したシフトを返すのみ。
+    # -------------------- TODO: 割当アルゴリズム --------------------
+    # 夜勤 1 名／世話人 1 名のロジックをここに実装してください
 
     return df, totals, limits
-
 
 # -------------------- Streamlit UI --------------------
 
@@ -97,10 +105,11 @@ if uploaded is not None:
             st.subheader("最適化後のシフト表")
             st.dataframe(df_opt, use_container_width=True)
 
-            st.subheader("勤務時間の合計と上限")
-            st.dataframe(
-                pd.DataFrame({"合計時間": totals, "上限時間": limits})
-            )
+            if not limits.empty:
+                st.subheader("勤務時間の合計と上限")
+                st.dataframe(
+                    pd.DataFrame({"合計時間": totals, "上限時間": limits})
+                )
 
             # Excel 出力
             buffer = io.BytesIO()
