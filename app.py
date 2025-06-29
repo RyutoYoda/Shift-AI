@@ -37,7 +37,7 @@ def detect_date_columns(df: pd.DataFrame) -> List[str]:
         header = str(df.at[DATE_HEADER_ROW, col]).strip()
         # 数字かどうかをチェック（日付として1-31の範囲を想定）
         try:
-            day = int(float(header))
+            day = int(float(header))  # float()を経由してからint()に変換
             if 1 <= day <= 31:
                 date_cols.append(col)
         except (ValueError, TypeError):
@@ -96,10 +96,10 @@ def parse_constraints(df: pd.DataFrame, staff_list: List[Tuple[str, int]]) -> Di
 
 def can_work_on_day(constraint: str, day: int, day_of_week: str) -> bool:
     """制約に基づいて指定日に勤務可能かチェック"""
-    if not constraint or constraint == "条件なし":
+    if not constraint or constraint == "条件なし" or str(constraint) == "nan":
         return True
     
-    constraint = constraint.lower()
+    constraint = str(constraint).lower()
     
     # 曜日制約
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
@@ -144,7 +144,11 @@ def can_assign_shift(df: pd.DataFrame, staff_name: str, staff_row: int, day_col:
         return False
     
     # 制約チェック
-    day_num = int(str(df.at[DATE_HEADER_ROW, day_col]))
+    try:
+        day_num = int(float(str(df.at[DATE_HEADER_ROW, day_col])))
+    except (ValueError, TypeError):
+        day_num = 1  # デフォルト値
+    
     # 曜日は簡易的に計算（実際のプロジェクトでは正確な日付計算が必要）
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
     day_of_week = weekdays[(day_num - 1) % 7]
