@@ -256,23 +256,30 @@ def optimize_shifts(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Serie
                 df.iloc[row, day_col_idx] = ""
     
     # -------------------- 結果の集計 --------------------
-    all_staff_names = [name for name, _ in night_staff + care_staff]
-    totals = pd.Series(dtype=float, index=all_staff_names)
-    limits_series = pd.Series(dtype=float, index=all_staff_names)
+    # 重複を避けるため、役職も含めた一意のキーを作成
+    all_staff_info = []
+    staff_totals = {}
+    staff_limits = {}
     
-    for name in all_staff_names:
-        # 夜勤時間
-        night_hours = 0
-        if name in [n for n, _ in night_staff]:
-            night_hours = count_staff_hours(assignment_history, name, True)
-        
-        # 世話人時間
-        care_hours = 0
-        if name in [n for n, _ in care_staff]:
-            care_hours = count_staff_hours(assignment_history, name, False)
-        
-        totals[name] = night_hours + care_hours
-        limits_series[name] = limits.get(name, 0)
+    # 夜勤スタッフの処理
+    for name, row in night_staff:
+        unique_key = f"{name}(夜勤)"
+        night_hours = count_staff_hours(assignment_history, name, True)
+        all_staff_info.append(unique_key)
+        staff_totals[unique_key] = night_hours
+        staff_limits[unique_key] = limits.get(name, 0)
+    
+    # 世話人スタッフの処理
+    for name, row in care_staff:
+        unique_key = f"{name}(世話人)"
+        care_hours = count_staff_hours(assignment_history, name, False)
+        all_staff_info.append(unique_key)
+        staff_totals[unique_key] = care_hours
+        staff_limits[unique_key] = limits.get(name, 0)
+    
+    # 重複がない一意のインデックスでSeries作成
+    totals = pd.Series(staff_totals, dtype=float)
+    limits_series = pd.Series(staff_limits, dtype=float)
     
     return df, totals, limits_series
 
@@ -359,22 +366,34 @@ if uploaded is not None:
 
             if not limits_series.empty:
                 st.subheader("勤務時間の合計と上限")
-                comparison_df = pd.DataFrame({
-                    "合計時間": totals, 
-                    "上限時間": limits_series,
-                    "残り時間": limits_series - totals
-                })
+                
+                # 重複インデックスを避けるためにDataFrameを直接構築
+                comparison_data = []
+                for staff_key in totals.index:
+                    comparison_data.append({
+                        "スタッフ": staff_key,
+                        "合計時間": totals[staff_key],
+                        "上限時間": limits_series[staff_key],
+                        "残り時間": limits_series[staff_key] - totals[staff_key]
+                    })
+                
+                comparison_df = pd.DataFrame(comparison_data)
+                
                 # 上限超過をハイライト
-                def highlight_over_limit(val):
-                    return 'background-color: red' if val < 0 else ''
+                def highlight_over_limit(row):
+                    color = 'background-color: red' if row['残り時間'] < 0 else ''
+                    return [color] * len(row)
                 
-                styled_df = comparison_df.style.applymap(highlight_over_limit, subset=['残り時間'])
-                st.dataframe(styled_df, use_container_width=True)
-                
-                # 上限超過の警告
-                over_limit_staff = comparison_df[comparison_df['残り時間'] < 0].index.tolist()
-                if over_limit_staff:
-                    st.warning(f"⚠️ 上限時間を超過しているスタッフ: {', '.join(over_limit_staff)}")
+                if len(comparison_df) > 0:
+                    styled_df = comparison_df.style.apply(highlight_over_limit, axis=1)
+                    st.dataframe(styled_df, use_container_width=True)
+                    
+                    # 上限超過の警告
+                    over_limit_staff = comparison_df[comparison_df['残り時間'] < 0]['スタッフ'].tolist()
+                    if over_limit_staff:
+                        st.warning(f"⚠️ 上限時間を超過しているスタッフ: {', '.join(over_limit_staff)}")
+                else:
+                    st.dataframe(comparison_df, use_container_width=True)
 
             # Excel 出力
             buffer = io.BytesIO()
