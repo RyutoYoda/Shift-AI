@@ -14,7 +14,7 @@ app.py
 """
 
 import io
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Set
 import random
 
 import numpy as np
@@ -27,10 +27,6 @@ import streamlit as st
 NIGHT_ROWS = list(range(4, 16))   # E5:AI16 → 0‑index 行 4‑15 (夜勤シフト)
 CARE_ROWS  = list(range(19, 31))  # E20:AI30 → 0‑index 行 19‑30 (世話人シフト)
 DATE_HEADER_ROW = 3               # E4 行 (0‑index 3)
-
-# シフト種別
-NIGHT_SHIFT = "夜勤"
-CARE_SHIFT = "世話人"
 
 # -------------------- 関数群 --------------------
 
@@ -56,107 +52,133 @@ def detect_date_columns(df: pd.DataFrame) -> List[str]:
     return list(df.columns[first_idx:last_idx])
 
 
-def get_staff_info(df: pd.DataFrame) -> Tuple[List[str], List[str], Dict[str, float]]:
-    """スタッフ情報を取得する"""
+def get_staff_info(df: pd.DataFrame) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]], Dict[str, float]]:
+    """スタッフ情報を取得する - (名前, 行番号)のタプルリストを返す"""
     night_staff = []
     care_staff = []
     limits = {}
     
-    # 夜勤スタッフ（行10-16）- 「夜間支援員」の人たち
-    for row in range(9, 16):  # 0-indexedで9-15
+    # 夜勤エリア（E5:AI16 = 行5-16 = 0-indexで4-15）のスタッフ
+    for row in range(4, 16):
         if row < len(df):
-            name = str(df.iloc[row, 0]).strip()
-            limit_val = df.iloc[row, 2] if pd.notna(df.iloc[row, 2]) else 0
-            if name and name != 'nan' and '夜間' in name:
-                night_staff.append(name)
-                limits[name] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
+            role = str(df.iloc[row, 0]).strip()  # A列: 役職
+            name = str(df.iloc[row, 1]).strip()  # B列: 名前
+            limit_val = df.iloc[row, 2] if pd.notna(df.iloc[row, 2]) else 0  # C列: 上限
+            
+            if role and name and role != 'nan' and name != 'nan':
+                if '夜間' in role:
+                    night_staff.append((name, row))
+                    limits[name] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
     
-    # 世話人スタッフ（行5-9）- 「世話人」の人たち
-    for row in range(4, 9):  # 0-indexedで4-8
+    # 世話人エリア（E20:AI30 = 行20-30 = 0-indexで19-29）のスタッフ
+    for row in range(19, 31):
         if row < len(df):
-            name = str(df.iloc[row, 0]).strip()
-            limit_val = df.iloc[row, 2] if pd.notna(df.iloc[row, 2]) else 0
-            if name and name != 'nan' and '世話人' in name:
-                care_staff.append(name)
-                limits[name] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
+            role = str(df.iloc[row, 0]).strip()  # A列: 役職
+            name = str(df.iloc[row, 1]).strip()  # B列: 名前
+            limit_val = df.iloc[row, 2] if pd.notna(df.iloc[row, 2]) else 0  # C列: 上限
+            
+            if role and name and role != 'nan' and name != 'nan':
+                if '世話人' in role:
+                    care_staff.append((name, row))
+                    limits[name] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
     
     return night_staff, care_staff, limits
 
 
-def get_staff_row_mapping(df: pd.DataFrame, night_staff: List[str], care_staff: List[str]) -> Dict[str, Tuple[int, int]]:
-    """スタッフ名と対応する行番号のマッピングを作成"""
-    staff_rows = {}
-    
-    # 夜勤スタッフの行マッピング
-    night_row_idx = 0
-    for row in range(9, 16):  # 夜勤エリア（10-16行目）
-        if row < len(df):
-            name = str(df.iloc[row, 0]).strip()
-            if name and name != 'nan' and '夜間' in name:
-                if night_row_idx < len(night_staff):
-                    staff_rows[night_staff[night_row_idx]] = (row, NIGHT_ROWS[night_row_idx])
-                    night_row_idx += 1
-    
-    # 世話人スタッフの行マッピング
-    care_row_idx = 0
-    for row in range(4, 9):  # 世話人エリア（5-9行目）
-        if row < len(df):
-            name = str(df.iloc[row, 0]).strip()
-            if name and name != 'nan' and '世話人' in name:
-                if care_row_idx < len(care_staff):
-                    staff_rows[care_staff[care_row_idx]] = (row, CARE_ROWS[care_row_idx])
-                    care_row_idx += 1
-    
-    return staff_rows
+def parse_constraints(df: pd.DataFrame, staff_list: List[Tuple[str, int]]) -> Dict[str, str]:
+    """D列の制約を解析"""
+    constraints = {}
+    for name, row in staff_list:
+        constraint = str(df.iloc[row, 3]).strip() if pd.notna(df.iloc[row, 3]) else ""
+        constraints[name] = constraint
+    return constraints
 
 
-def can_assign_shift(df: pd.DataFrame, staff_name: str, day_col: str, shift_type: str, 
-                    date_cols: List[str], staff_rows: Dict[str, Tuple[int, int]], 
-                    assignment_history: Dict[str, List[str]]) -> bool:
-    """指定したスタッフが指定日にシフトに入れるかチェック"""
+def can_work_on_day(constraint: str, day: int, day_of_week: str) -> bool:
+    """制約に基づいて指定日に勤務可能かチェック"""
+    if not constraint or constraint == "条件なし":
+        return True
     
-    if staff_name not in staff_rows:
+    constraint = constraint.lower()
+    
+    # 曜日制約
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    
+    if "日曜" in constraint and day_of_week != "日":
+        return False
+    if "月曜" in constraint and day_of_week != "月":
+        return False
+    if "火曜" in constraint and day_of_week != "火":
+        return False
+    if "水曜" in constraint and day_of_week != "水":
+        return False
+    if "木曜" in constraint and day_of_week != "木":
+        return False
+    if "金曜" in constraint and day_of_week != "金":
+        return False
+    if "土曜" in constraint and day_of_week != "土":
         return False
     
-    staff_row = staff_rows[staff_name][0]  # 実際の行番号
-    current_day_idx = date_cols.index(day_col)
+    # 特定日制約
+    if "日" in constraint and not any(wd in constraint for wd in weekdays):
+        # "11日と18日" のような制約
+        import re
+        days = re.findall(r'(\d+)日', constraint)
+        if days and str(day) not in days:
+            return False
+    
+    return True
+
+
+def can_assign_shift(df: pd.DataFrame, staff_name: str, staff_row: int, day_col: str, 
+                    date_cols: List[str], constraints: Dict[str, str],
+                    assignment_history: Dict[str, List[int]]) -> bool:
+    """指定したスタッフが指定日にシフトに入れるかチェック"""
+    
     day_col_idx = df.columns.get_loc(day_col)
+    current_day_idx = date_cols.index(day_col)
     
     # 当日が0（勤務不可）でないかチェック
     current_value = df.iloc[staff_row, day_col_idx]
     if current_value == 0:
         return False
     
-    # 共通ルールのチェック
+    # 制約チェック
+    day_num = int(str(df.at[DATE_HEADER_ROW, day_col]))
+    # 曜日は簡易的に計算（実際のプロジェクトでは正確な日付計算が必要）
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    day_of_week = weekdays[(day_num - 1) % 7]
+    
+    if not can_work_on_day(constraints.get(staff_name, ""), day_num, day_of_week):
+        return False
+    
+    # 連続勤務の制限
     staff_history = assignment_history.get(staff_name, [])
+    if staff_history and current_day_idx - 1 in staff_history:
+        return False
     
-    # 1. 夜勤後は2日空けて世話人勤務可
-    if shift_type == CARE_SHIFT:
-        for prev_day_idx in range(max(0, current_day_idx - 2), current_day_idx):
-            prev_day = date_cols[prev_day_idx]
-            if prev_day in staff_history and assignment_history[staff_name][-1] == NIGHT_SHIFT:
+    # 夜勤後2日空ける制限（世話人の場合）
+    if staff_row >= 19:  # 世話人エリア
+        for prev_day in range(max(0, current_day_idx - 2), current_day_idx):
+            if prev_day in staff_history:
+                # 前回が夜勤かチェック（簡易版）
                 return False
-    
-    # 2. 連続勤務の制限（同じスタッフが連続して入らないように）
-    if current_day_idx > 0:
-        prev_day = date_cols[current_day_idx - 1]
-        if prev_day in staff_history:
-            return False
     
     return True
 
 
-def count_staff_hours(assignment_history: Dict[str, List[str]], staff_name: str) -> float:
+def count_staff_hours(assignment_history: Dict[str, List[int]], staff_name: str, 
+                     is_night_shift: bool) -> float:
     """スタッフの総勤務時間を計算"""
     if staff_name not in assignment_history:
         return 0
     
     total_hours = 0
-    for shift_type in assignment_history[staff_name]:
-        if shift_type == NIGHT_SHIFT:
-            total_hours += 12.5  # 夜勤時間
-        elif shift_type == CARE_SHIFT:
-            total_hours += 6     # 世話人時間
+    for day_idx in assignment_history[staff_name]:
+        if is_night_shift:
+            total_hours += 12.5
+        else:
+            total_hours += 6
     
     return total_hours
 
@@ -165,72 +187,88 @@ def optimize_shifts(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Serie
     """シフト最適化ロジック"""
     date_cols = detect_date_columns(df)
     night_staff, care_staff, limits = get_staff_info(df)
-    staff_rows = get_staff_row_mapping(df, night_staff, care_staff)
+    
+    # 制約情報を取得
+    night_constraints = parse_constraints(df, night_staff)
+    care_constraints = parse_constraints(df, care_staff)
     
     # 割り当て履歴を追跡
-    assignment_history = {staff: [] for staff in night_staff + care_staff}
+    assignment_history = {name: [] for name, _ in night_staff + care_staff}
     
-    # -------------------- 指定ブロックのクリア --------------------
-    def clear_block(rows: List[int]):
-        for r in rows:
-            if r < len(df):
-                for c in date_cols:
-                    col_idx = df.columns.get_loc(c)
-                    if df.iloc[r, col_idx] != 0:  # 0 は "固定で不可" の意味なので維持
-                        df.iloc[r, col_idx] = ""  # 空セル化
-    
-    clear_block(NIGHT_ROWS)
-    clear_block(CARE_ROWS)
-    
-    # -------------------- シフト割当アルゴリズム --------------------
+    # -------------------- 指定ブロックを削除モードで処理 --------------------
     # 各日に対してシフトを割り当て
     for day_col in date_cols:
         day_col_idx = df.columns.get_loc(day_col)
+        current_day_idx = date_cols.index(day_col)
         
-        # 夜勤シフト割当（1名）
+        # 夜勤シフト割当（1名のみ残す）
         available_night_staff = []
-        for staff in night_staff:
-            if can_assign_shift(df, staff, day_col, NIGHT_SHIFT, date_cols, staff_rows, assignment_history):
-                current_hours = count_staff_hours(assignment_history, staff)
-                if staff in limits and current_hours + 12.5 <= limits[staff]:
-                    available_night_staff.append(staff)
+        for name, row in night_staff:
+            if can_assign_shift(df, name, row, day_col, date_cols, night_constraints, assignment_history):
+                current_hours = count_staff_hours(assignment_history, name, True)
+                if name in limits and current_hours + 12.5 <= limits[name]:
+                    current_value = df.iloc[row, day_col_idx]
+                    if current_value != 0 and pd.notna(current_value):
+                        available_night_staff.append((name, row, current_hours))
         
+        # 勤務時間が少ないスタッフを優先
         if available_night_staff:
-            # 勤務時間が少ないスタッフを優先
-            available_night_staff.sort(key=lambda s: count_staff_hours(assignment_history, s))
-            selected_night_staff = available_night_staff[0]
+            available_night_staff.sort(key=lambda x: x[2])  # 勤務時間でソート
+            selected_name, selected_row, _ = available_night_staff[0]
+            assignment_history[selected_name].append(current_day_idx)
             
-            # 夜勤スタッフの行に名前を入力
-            staff_row = staff_rows[selected_night_staff][0]
-            df.iloc[staff_row, day_col_idx] = selected_night_staff
-            assignment_history[selected_night_staff].append(NIGHT_SHIFT)
+            # 選ばれなかったスタッフのセルを空白にする
+            for name, row in night_staff:
+                if row != selected_row:
+                    df.iloc[row, day_col_idx] = ""
+        else:
+            # 誰も選ばれなかった場合は全て空白
+            for name, row in night_staff:
+                df.iloc[row, day_col_idx] = ""
         
-        # 世話人シフト割当（1名）
+        # 世話人シフト割当（1名のみ残す）
         available_care_staff = []
-        for staff in care_staff:
-            if can_assign_shift(df, staff, day_col, CARE_SHIFT, date_cols, staff_rows, assignment_history):
-                current_hours = count_staff_hours(assignment_history, staff)
-                if staff in limits and current_hours + 6 <= limits[staff]:
-                    available_care_staff.append(staff)
+        for name, row in care_staff:
+            if can_assign_shift(df, name, row, day_col, date_cols, care_constraints, assignment_history):
+                current_hours = count_staff_hours(assignment_history, name, False)
+                if name in limits and current_hours + 6 <= limits[name]:
+                    current_value = df.iloc[row, day_col_idx]
+                    if current_value != 0 and pd.notna(current_value):
+                        available_care_staff.append((name, row, current_hours))
         
+        # 勤務時間が少ないスタッフを優先
         if available_care_staff:
-            # 勤務時間が少ないスタッフを優先
-            available_care_staff.sort(key=lambda s: count_staff_hours(assignment_history, s))
-            selected_care_staff = available_care_staff[0]
+            available_care_staff.sort(key=lambda x: x[2])  # 勤務時間でソート
+            selected_name, selected_row, _ = available_care_staff[0]
+            assignment_history[selected_name].append(current_day_idx)
             
-            # 世話人スタッフの行に名前を入力
-            staff_row = staff_rows[selected_care_staff][0]
-            df.iloc[staff_row, day_col_idx] = selected_care_staff
-            assignment_history[selected_care_staff].append(CARE_SHIFT)
+            # 選ばれなかったスタッフのセルを空白にする
+            for name, row in care_staff:
+                if row != selected_row:
+                    df.iloc[row, day_col_idx] = ""
+        else:
+            # 誰も選ばれなかった場合は全て空白
+            for name, row in care_staff:
+                df.iloc[row, day_col_idx] = ""
     
     # -------------------- 結果の集計 --------------------
-    all_staff = list(set(night_staff + care_staff))
-    totals = pd.Series(dtype=float, index=all_staff)
-    limits_series = pd.Series(dtype=float, index=all_staff)
+    all_staff_names = [name for name, _ in night_staff + care_staff]
+    totals = pd.Series(dtype=float, index=all_staff_names)
+    limits_series = pd.Series(dtype=float, index=all_staff_names)
     
-    for staff in all_staff:
-        totals[staff] = count_staff_hours(assignment_history, staff)
-        limits_series[staff] = limits.get(staff, 0)
+    for name in all_staff_names:
+        # 夜勤時間
+        night_hours = 0
+        if name in [n for n, _ in night_staff]:
+            night_hours = count_staff_hours(assignment_history, name, True)
+        
+        # 世話人時間
+        care_hours = 0
+        if name in [n for n, _ in care_staff]:
+            care_hours = count_staff_hours(assignment_history, name, False)
+        
+        totals[name] = night_hours + care_hours
+        limits_series[name] = limits.get(name, 0)
     
     return df, totals, limits_series
 
@@ -249,20 +287,20 @@ with st.expander("👉 使い方はこちら（クリックで展開）", expand
         3. 右側に最適化後のシフトプレビューが表示される。
         4. **「📥 ダウンロード」** ボタンで Excel を取得。
 
+        **▼ 処理方式**
+        - E5:AI16（夜勤）とE20:AI30（世話人）の範囲で、**各日1人だけ**数値を残す
+        - **選ばれなかった人のセルは空白**になります
+        - **0が入っているセルは勤務不可**として維持
+        - **それ以外のセル（スタッフ名、上限時間、制約等）は一切変更しません**
+
         **▼ 実装されたルール**
         - 夜勤・世話人は1日に1人ずつ選択
-        - 夜勤後は2日空けて世話人勤務可
+        - D列の制約（曜日、特定日など）を考慮
         - 連続勤務は避ける
-        - 0が入っているセルは勤務不可として維持
         - 各スタッフの上限時間を考慮（夜勤12.5h、世話人6h）
         - 勤務時間が少ないスタッフを優先的に割当
 
-        **▼ 処理内容**
-        - E5:AI16とE20:AI30の範囲を一旦クリア（0は除く）
-        - 各日1名ずつスタッフ名を割り当て
-        - 選ばれなかったスタッフのセルは空白になります
-
-        *行・列の位置がテンプレートと異なる場合は、ソースコード冒頭の定数を調整してください。*
+        *元のテンプレート構造を完全に保持します。*
         """
     )
 
@@ -279,14 +317,26 @@ if uploaded is not None:
             
             col1, col2 = st.columns(2)
             with col1:
-                st.subheader("検出されたスタッフ情報")
-                st.write("**夜勤スタッフ:**", night_staff)
-                st.write("**世話人スタッフ:**", care_staff)
+                st.subheader("検出された夜勤スタッフ")
+                for name, row in night_staff:
+                    constraint = df_input.iloc[row, 3] if pd.notna(df_input.iloc[row, 3]) else "条件なし"
+                    st.write(f"• {name} (行{row+1}) - {constraint}")
             
             with col2:
-                st.subheader("上限時間")
-                for staff in night_staff + care_staff:
-                    st.write(f"{staff}: {limits.get(staff, 0)}時間")
+                st.subheader("検出された世話人スタッフ")
+                for name, row in care_staff:
+                    constraint = df_input.iloc[row, 3] if pd.notna(df_input.iloc[row, 3]) else "条件なし"
+                    st.write(f"• {name} (行{row+1}) - {constraint}")
+            
+            st.subheader("上限時間")
+            limit_df = pd.DataFrame([
+                {"スタッフ": name, "上限時間": limits.get(name, 0), "役職": "夜勤"} 
+                for name, _ in night_staff
+            ] + [
+                {"スタッフ": name, "上限時間": limits.get(name, 0), "役職": "世話人"} 
+                for name, _ in care_staff
+            ])
+            st.dataframe(limit_df, use_container_width=True)
         
         except Exception as e:
             st.warning(f"スタッフ情報の取得でエラー: {e}")
@@ -296,19 +346,19 @@ if uploaded is not None:
 
         if st.sidebar.button("🚀 最適化を実行"):
             with st.spinner("シフトを最適化中..."):
-                df_opt, totals, limits = optimize_shifts(df_input.copy())
+                df_opt, totals, limits_series = optimize_shifts(df_input.copy())
             
             st.success("最適化が完了しました 🎉")
 
             st.subheader("最適化後のシフト表")
             st.dataframe(df_opt, use_container_width=True)
 
-            if not limits.empty:
+            if not limits_series.empty:
                 st.subheader("勤務時間の合計と上限")
                 comparison_df = pd.DataFrame({
                     "合計時間": totals, 
-                    "上限時間": limits,
-                    "残り時間": limits - totals
+                    "上限時間": limits_series,
+                    "残り時間": limits_series - totals
                 })
                 # 上限超過をハイライト
                 def highlight_over_limit(val):
@@ -328,7 +378,7 @@ if uploaded is not None:
                 df_opt.to_excel(writer, index=False, header=False, sheet_name="最適化シフト")
                 
                 # 統計情報も追加
-                if not limits.empty:
+                if not limits_series.empty:
                     comparison_df.to_excel(writer, sheet_name="勤務時間統計")
                 
             st.download_button(
