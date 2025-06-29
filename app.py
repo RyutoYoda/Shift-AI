@@ -22,13 +22,13 @@ import pandas as pd
 import streamlit as st
 
 # -------------------- 定数 --------------------
-# CSVファイルの構造に基づく調整
-NIGHT_ROWS_GH1 = list(range(10, 16))  # グループホーム①夜勤（11-16行目、0-indexedで10-15）
-CARE_ROWS_GH1  = list(range(5, 10))   # グループホーム①世話人（6-10行目、0-indexedで5-9）
-NIGHT_ROWS_GH2 = list(range(25, 31))  # グループホーム②夜勤（26-31行目、0-indexedで25-30）
-CARE_ROWS_GH2  = list(range(20, 25))  # グループホーム②世話人（21-25行目、0-indexedで20-24）
-DATE_HEADER_ROW = 4                   # 5行目（0-index 4）
-DATE_START_COL = 5                    # 日付データは6列目以降（0-indexedで5以降）
+# Excelファイルの正しい構造に基づく調整
+CARE_ROWS_GH1  = list(range(4, 9))    # グループホーム①世話人（5-9行目、0-indexedで4-8）
+NIGHT_ROWS_GH1 = list(range(9, 16))   # グループホーム①夜勤（10-16行目、0-indexedで9-15）
+CARE_ROWS_GH2  = list(range(19, 24))  # グループホーム②世話人（20-24行目、0-indexedで19-23）
+NIGHT_ROWS_GH2 = list(range(24, 30))  # グループホーム②夜勤（25-30行目、0-indexedで24-29）
+DATE_HEADER_ROW = 3                   # 4行目（0-index 3）
+DATE_START_COL = 4                    # 日付データは5列目以降（0-indexedで4以降）
 
 # -------------------- 関数群 --------------------
 
@@ -36,7 +36,7 @@ def detect_date_columns(df: pd.DataFrame) -> List[str]:
     """ヘッダーから日付列を推定し、連続する範囲（列名リスト）を返す"""
     date_cols = []
     
-    # 5列目以降を日付列として扱う
+    # 4列目以降を日付列として扱う（E列以降）
     for col_idx in range(DATE_START_COL, len(df.columns)):
         col = df.columns[col_idx]
         try:
@@ -62,49 +62,49 @@ def get_staff_info(df: pd.DataFrame) -> Tuple[List[Tuple[str, int]], List[Tuple[
     care_staff_gh2 = []
     limits = {}
     
-    # グループホーム①の夜勤スタッフ
-    for row in NIGHT_ROWS_GH1:
-        if row < len(df):
-            role = str(df.iloc[row, 1]).strip()  # B列: 役職
-            name = str(df.iloc[row, 2]).strip()  # C列: 名前
-            limit_val = df.iloc[row, 3] if pd.notna(df.iloc[row, 3]) else 0  # D列: 上限
-            
-            if role and name and role != 'nan' and name != 'nan' and '夜間' in role:
-                night_staff_gh1.append((name, row))
-                limits[f"{name}_GH1_夜勤"] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
-    
-    # グループホーム①の世話人スタッフ
+    # グループホーム①の世話人スタッフ（5-9行目）
     for row in CARE_ROWS_GH1:
         if row < len(df):
-            role = str(df.iloc[row, 1]).strip()  # B列: 役職
-            name = str(df.iloc[row, 2]).strip()  # C列: 名前
-            limit_val = df.iloc[row, 3] if pd.notna(df.iloc[row, 3]) else 0  # D列: 上限
+            role = str(df.iloc[row, 0]).strip()  # A列: 役職
+            name = str(df.iloc[row, 1]).strip()  # B列: 名前
+            limit_val = df.iloc[row, 2] if pd.notna(df.iloc[row, 2]) else 0  # C列: 上限
             
             if role and name and role != 'nan' and name != 'nan' and '世話人' in role:
                 care_staff_gh1.append((name, row))
                 limits[f"{name}_GH1_世話人"] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
     
-    # グループホーム②の夜勤スタッフ
-    for row in NIGHT_ROWS_GH2:
+    # グループホーム①の夜勤スタッフ（10-16行目）
+    for row in NIGHT_ROWS_GH1:
         if row < len(df):
-            role = str(df.iloc[row, 1]).strip()  # B列: 役職
-            name = str(df.iloc[row, 2]).strip()  # C列: 名前
-            limit_val = df.iloc[row, 3] if pd.notna(df.iloc[row, 3]) else 0  # D列: 上限
+            role = str(df.iloc[row, 0]).strip()  # A列: 役職
+            name = str(df.iloc[row, 1]).strip()  # B列: 名前
+            limit_val = df.iloc[row, 2] if pd.notna(df.iloc[row, 2]) else 0  # C列: 上限
             
             if role and name and role != 'nan' and name != 'nan' and '夜間' in role:
-                night_staff_gh2.append((name, row))
-                limits[f"{name}_GH2_夜勤"] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
+                night_staff_gh1.append((name, row))
+                limits[f"{name}_GH1_夜勤"] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
     
-    # グループホーム②の世話人スタッフ
+    # グループホーム②の世話人スタッフ（20-24行目）
     for row in CARE_ROWS_GH2:
         if row < len(df):
-            role = str(df.iloc[row, 1]).strip()  # B列: 役職
-            name = str(df.iloc[row, 2]).strip()  # C列: 名前
-            limit_val = df.iloc[row, 3] if pd.notna(df.iloc[row, 3]) else 0  # D列: 上限
+            role = str(df.iloc[row, 0]).strip()  # A列: 役職
+            name = str(df.iloc[row, 1]).strip()  # B列: 名前
+            limit_val = df.iloc[row, 2] if pd.notna(df.iloc[row, 2]) else 0  # C列: 上限
             
             if role and name and role != 'nan' and name != 'nan' and '世話人' in role:
                 care_staff_gh2.append((name, row))
                 limits[f"{name}_GH2_世話人"] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
+    
+    # グループホーム②の夜勤スタッフ（25-30行目）
+    for row in NIGHT_ROWS_GH2:
+        if row < len(df):
+            role = str(df.iloc[row, 0]).strip()  # A列: 役職
+            name = str(df.iloc[row, 1]).strip()  # B列: 名前
+            limit_val = df.iloc[row, 2] if pd.notna(df.iloc[row, 2]) else 0  # C列: 上限
+            
+            if role and name and role != 'nan' and name != 'nan' and '夜間' in role:
+                night_staff_gh2.append((name, row))
+                limits[f"{name}_GH2_夜勤"] = float(limit_val) if isinstance(limit_val, (int, float)) else 0
     
     return night_staff_gh1, care_staff_gh1, night_staff_gh2, care_staff_gh2, limits
 
@@ -113,7 +113,7 @@ def parse_constraints(df: pd.DataFrame, staff_list: List[Tuple[str, int]]) -> Di
     """D列の制約を解析"""
     constraints = {}
     for name, row in staff_list:
-        constraint = str(df.iloc[row, 4]).strip() if pd.notna(df.iloc[row, 4]) else ""  # E列: 制約
+        constraint = str(df.iloc[row, 3]).strip() if pd.notna(df.iloc[row, 3]) else ""  # D列: 制約
         constraints[name] = constraint
     return constraints
 
@@ -376,22 +376,22 @@ if uploaded is not None:
                 st.subheader("グループホーム① スタッフ")
                 st.write("**夜勤:**")
                 for name, row in night_staff_gh1:
-                    constraint = df_input.iloc[row, 4] if pd.notna(df_input.iloc[row, 4]) else "条件なし"
+                    constraint = df_input.iloc[row, 3] if pd.notna(df_input.iloc[row, 3]) else "条件なし"
                     st.write(f"• {name} (行{row+1}) - {constraint}")
                 st.write("**世話人:**")
                 for name, row in care_staff_gh1:
-                    constraint = df_input.iloc[row, 4] if pd.notna(df_input.iloc[row, 4]) else "条件なし"
+                    constraint = df_input.iloc[row, 3] if pd.notna(df_input.iloc[row, 3]) else "条件なし"
                     st.write(f"• {name} (行{row+1}) - {constraint}")
             
             with col2:
                 st.subheader("グループホーム② スタッフ")
                 st.write("**夜勤:**")
                 for name, row in night_staff_gh2:
-                    constraint = df_input.iloc[row, 4] if pd.notna(df_input.iloc[row, 4]) else "条件なし"
+                    constraint = df_input.iloc[row, 3] if pd.notna(df_input.iloc[row, 3]) else "条件なし"
                     st.write(f"• {name} (行{row+1}) - {constraint}")
                 st.write("**世話人:**")
                 for name, row in care_staff_gh2:
-                    constraint = df_input.iloc[row, 4] if pd.notna(df_input.iloc[row, 4]) else "条件なし"
+                    constraint = df_input.iloc[row, 3] if pd.notna(df_input.iloc[row, 3]) else "条件なし"
                     st.write(f"• {name} (行{row+1}) - {constraint}")
         
         except Exception as e:
