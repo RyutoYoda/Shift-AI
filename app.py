@@ -208,32 +208,30 @@ def can_assign_shift(df: pd.DataFrame, staff_name: str, staff_row: int, day_col:
     if not can_work_on_day(constraints.get(staff_name, ""), day_num, day_of_week):
         return False
     
-    # 共通ルールのチェック
+    # 共通ルールのチェック（絶対条件）
     staff_assignments = all_assignments.get(staff_name, [])
-    
-    # 現在割り当てようとしているシフトタイプを判定
     current_shift_type = "夜勤" if shift_hours == 12.5 else "世話人"
     
     for prev_day_idx, prev_shift_type in staff_assignments:
         gap = current_day_idx - prev_day_idx
         
         if current_shift_type == "夜勤":
-            # 夜勤の場合：前回の勤務から2日以上空ける
-            if gap <= 2:
+            # 夜勤の場合：前回の夜勤から必ず3日以上空ける（2日空けルール）
+            if prev_shift_type == "夜勤" and gap < 3:
                 return False
         elif current_shift_type == "世話人":
             # 世話人の場合：夜勤後は2日空けて世話人勤務可
-            if prev_shift_type == "夜勤" and gap <= 2:
+            if prev_shift_type == "夜勤" and gap < 3:
                 return False
             # 世話人の連続勤務も避ける
-            if prev_shift_type == "世話人" and gap <= 1:
+            if prev_shift_type == "世話人" and gap < 2:
                 return False
     
     return True
 
 
 def optimize_shifts(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """シフト最適化ロジック - 上限を絶対に守り、共通ルールを適用"""
+    """シフト最適化ロジック - 毎日4人必須、夜勤2日空き絶対、上限厳守"""
     date_cols = detect_date_columns(df)
     night_staff_gh1, care_staff_gh1, night_staff_gh2, care_staff_gh2, limits = get_staff_info(df)
     
@@ -243,9 +241,8 @@ def optimize_shifts(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Serie
     night_constraints_gh2 = parse_constraints(df, night_staff_gh2)
     care_constraints_gh2 = parse_constraints(df, care_staff_gh2)
     
-    # 割り当て履歴を追跡（スタッフごとの累計時間）
+    # 割り当て履歴を追跡
     assignment_history = {}
-    # 詳細な割り当て履歴（日付とシフトタイプ）
     all_assignments = {}
     
     for name, _ in night_staff_gh1 + care_staff_gh1 + night_staff_gh2 + care_staff_gh2:
@@ -256,42 +253,45 @@ def optimize_shifts(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Serie
     for day_col in date_cols:
         day_col_idx = df.columns.get_loc(day_col)
         
-        # グループホーム①のクリア
-        for name, row in night_staff_gh1 + care_staff_gh1:
-            if df.iloc[row, day_col_idx] != 0:
-                df.iloc[row, day_col_idx] = ""
-        
-        # グループホーム②のクリア
-        for name, row in night_staff_gh2 + care_staff_gh2:
+        # 全グループのクリア
+        for name, row in night_staff_gh1 + care_staff_gh1 + night_staff_gh2 + care_staff_gh2:
             if df.iloc[row, day_col_idx] != 0:
                 df.iloc[row, day_col_idx] = ""
     
-    # 各日に対してシフト割り当て（必ず1人ずつカバー）
+    # 各日に対してシフト割り当て（毎日4人必須）
+    coverage_issues = []
+    
     for day_idx, day_col in enumerate(date_cols):
         day_col_idx = df.columns.get_loc(day_col)
+        day_coverage = {"GH1夜勤": False, "GH1世話人": False, "GH2夜勤": False, "GH2世話人": False}
         
-        # グループホーム①の夜勤シフト割当（必須）
+        # === グループホーム①の夜勤シフト割当（必須） ===
         available_staff = []
         for name, row in night_staff_gh1:
             if can_assign_shift(df, name, row, day_col, date_cols, night_constraints_gh1, 
                                assignment_history, limits, 12.5, all_assignments):
                 current_hours = assignment_history[name]
-                # 残り時間で優先順位を決定（残り時間が少ないほど優先）
                 remaining_hours = limits.get(name, 1000) - current_hours
-                available_staff.append((name, row, remaining_hours, current_hours))
+                # 最後の夜勤からの日数を計算
+                last_night_gap = 999
+                for prev_day, prev_type in all_assignments[name]:
+                    if prev_type == "夜勤":
+                        last_night_gap = min(last_night_gap, day_idx - prev_day)
+                
+                available_staff.append((name, row, remaining_hours, current_hours, last_night_gap))
         
         if available_staff:
-            # 残り時間が少ない順、勤務時間が少ない順でソート
-            available_staff.sort(key=lambda x: (x[2], x[3]))
-            selected_name, selected_row, _, _ = available_staff[0]
+            # 残り時間が少ない順、夜勤間隔が長い順、勤務時間が少ない順でソート
+            available_staff.sort(key=lambda x: (x[2], -x[4], x[3]))
+            selected_name, selected_row, _, _, _ = available_staff[0]
             df.iloc[selected_row, day_col_idx] = 12.5
             assignment_history[selected_name] += 12.5
             all_assignments[selected_name].append((day_idx, "夜勤"))
+            day_coverage["GH1夜勤"] = True
         else:
-            # 誰も割り当てられない場合、制約を緩和して再試行
-            st.warning(f"⚠️ {day_idx+1}日の夜勤に誰も割り当てできませんでした（上限・制約により）")
+            coverage_issues.append(f"{day_idx+1}日のGH1夜勤")
         
-        # グループホーム①の世話人シフト割当（必須）
+        # === グループホーム①の世話人シフト割当（必須） ===
         available_staff = []
         for name, row in care_staff_gh1:
             if can_assign_shift(df, name, row, day_col, date_cols, care_constraints_gh1, 
@@ -306,26 +306,35 @@ def optimize_shifts(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Serie
             df.iloc[selected_row, day_col_idx] = 6
             assignment_history[selected_name] += 6
             all_assignments[selected_name].append((day_idx, "世話人"))
+            day_coverage["GH1世話人"] = True
         else:
-            st.warning(f"⚠️ {day_idx+1}日の世話人に誰も割り当てできませんでした（上限・制約により）")
+            coverage_issues.append(f"{day_idx+1}日のGH1世話人")
         
-        # グループホーム②の夜勤シフト割当
+        # === グループホーム②の夜勤シフト割当（必須） ===
         available_staff = []
         for name, row in night_staff_gh2:
             if can_assign_shift(df, name, row, day_col, date_cols, night_constraints_gh2, 
                                assignment_history, limits, 12.5, all_assignments):
                 current_hours = assignment_history[name]
                 remaining_hours = limits.get(name, 1000) - current_hours
-                available_staff.append((name, row, remaining_hours, current_hours))
+                last_night_gap = 999
+                for prev_day, prev_type in all_assignments[name]:
+                    if prev_type == "夜勤":
+                        last_night_gap = min(last_night_gap, day_idx - prev_day)
+                
+                available_staff.append((name, row, remaining_hours, current_hours, last_night_gap))
         
         if available_staff:
-            available_staff.sort(key=lambda x: (x[2], x[3]))
-            selected_name, selected_row, _, _ = available_staff[0]
+            available_staff.sort(key=lambda x: (x[2], -x[4], x[3]))
+            selected_name, selected_row, _, _, _ = available_staff[0]
             df.iloc[selected_row, day_col_idx] = 12.5
             assignment_history[selected_name] += 12.5
             all_assignments[selected_name].append((day_idx, "夜勤"))
+            day_coverage["GH2夜勤"] = True
+        else:
+            coverage_issues.append(f"{day_idx+1}日のGH2夜勤")
         
-        # グループホーム②の世話人シフト割当
+        # === グループホーム②の世話人シフト割当（必須） ===
         available_staff = []
         for name, row in care_staff_gh2:
             if can_assign_shift(df, name, row, day_col, date_cols, care_constraints_gh2, 
@@ -340,12 +349,19 @@ def optimize_shifts(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Serie
             df.iloc[selected_row, day_col_idx] = 6
             assignment_history[selected_name] += 6
             all_assignments[selected_name].append((day_idx, "世話人"))
+            day_coverage["GH2世話人"] = True
+        else:
+            coverage_issues.append(f"{day_idx+1}日のGH2世話人")
+    
+    # カバレッジの問題を警告
+    if coverage_issues:
+        st.error(f"⚠️ 以下のシフトに人員を配置できませんでした: {', '.join(coverage_issues)}")
+        st.error("原因: 上限時間不足、夜勤2日空きルール、または個人制約")
     
     # -------------------- 結果の集計 --------------------
     staff_totals = {}
     staff_limits = {}
     
-    # 全スタッフの勤務時間を計算
     all_staff_names = set()
     for name, _ in night_staff_gh1 + care_staff_gh1 + night_staff_gh2 + care_staff_gh2:
         all_staff_names.add(name)
@@ -382,12 +398,12 @@ with st.expander("👉 使い方はこちら（クリックで展開）", expand
         - **それ以外のセル（スタッフ名、上限時間、制約等）は一切変更しません**
 
         **▼ 実装されたルール**
+        - **毎日4人必須**: GH①夜勤1人 + GH①世話人1人 + GH②夜勤1人 + GH②世話人1人
+        - **夜勤2日空きルール（絶対）**: 夜勤→2日休み→次の夜勤可能
         - **共通ルール（厳格適用）**:
           - 夜勤後は2日空けて世話人勤務可
-          - 夜勤の連続勤務は2日以上空ける
           - 世話人から翌日夜勤入り可能
-          - 夜間・支援は1日に一人ずつ（必須）
-        - 夜勤・世話人は1日に1人ずつ選択（各グループで）
+          - 世話人も連続勤務は避ける
         - D列の制約（曜日、特定日など）を厳格に適用
         - **上限時間の厳守**（これを最優先）
         - 上限が厳しいスタッフから優先的に割当
